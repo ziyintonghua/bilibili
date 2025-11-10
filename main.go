@@ -3,59 +3,71 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-// Config 应用配置
+// ==================== 类型定义（最前面） ====================
+
 type Config struct {
 	Cookie        string `json:"cookie"`
+	CookieFile    string `json:"cookieFile"`
 	DownloadVideo bool   `json:"downloadVideo"`
-	VideoEncoder  string `json:"videoEncoder"` // 如: libx264, h264_nvenc
-	Concurrency   int    `json:"concurrency"`  // 并发数限制
-	Timeout       int    `json:"timeout"`      // 单任务超时(秒)
+	VideoEncoder  string `json:"videoEncoder"`
+	Concurrency   int    `json:"concurrency"`
+	Timeout       int    `json:"timeout"`
 }
 
-// VideoInfo 视频分P信息
 type VideoInfo struct {
 	CID      string
 	PartName string
-	Index    int // 分P序号
+	Index    int
 }
 
-// StreamURLs 音视频流地址
 type StreamURLs struct {
 	AudioURL string
 	VideoURL string
+	Codec    string
+	Quality  int
 }
 
-// BilibiliClient B站API客户端
 type BilibiliClient struct {
 	httpClient *http.Client
 	headers    map[string]string
 	config     *Config
 }
 
-// NewBilibiliClient 创建客户端
+// ==================== 构造函数和辅助函数 ====================
+
 func NewBilibiliClient(config *Config) *BilibiliClient {
 	return &BilibiliClient{
 		httpClient: &http.Client{
 			Timeout: time.Duration(config.Timeout) * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return fmt.Errorf("too many redirects")
+				}
+				return nil
+			},
 		},
 		headers: getHeaders(config),
 		config:  config,
 	}
 }
 
-// getHeaders 生成请求头
 func getHeaders(config *Config) map[string]string {
 	return map[string]string{
 		"accept":             "application/json, text/plain, */*",
@@ -73,16 +85,21 @@ func getHeaders(config *Config) map[string]string {
 	}
 }
 
-// sanitizeFileName 清理文件名
 func sanitizeFileName(name string) string {
-	reg := regexp.MustCompile(`[<>:"/\\|?*]+`)
-	return strings.TrimSpace(reg.ReplaceAllString(name, "_"))
+	reg := regexp.MustCompile(`[\x00-\x1f\x7f<>:"/\\|?*]+`)
+	name = reg.ReplaceAllString(name, "_")
+	if len(name) > 100 {
+		name = name[:100]
+	}
+	return strings.TrimSpace(name)
 }
 
-// GetVideoInfo 获取视频分P列表
+// ==================== BilibiliClient 方法 ====================
+
 func (c *BilibiliClient) GetVideoInfo(bvid string) ([]VideoInfo, error) {
-	url := fmt.Sprintf("https://api.bilibili.com/x/player/pagelist?bvid=%s", bvid)
-	req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	apiURL := fmt.Sprintf("https://api.bilibili.com/x/player/pagelist?bvid=%s", url.QueryEscape(bvid))
+	
+	req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
@@ -98,7 +115,8 @@ func (c *BilibiliClient) GetVideoInfo(bvid string) ([]VideoInfo, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API返回错误状态码: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API返回错误状态码: %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -129,23 +147,19 @@ func (c *BilibiliClient) GetVideoInfo(bvid string) ([]VideoInfo, error) {
 	return infos, nil
 }
 
-// GetStreamURLs 获取音视频流地址（带WBI签名）
 func (c *BilibiliClient) GetStreamURLs(bvid, cid string) (*StreamURLs, error) {
-	// 注意：B站新版playurl接口需要WBI签名
-	// 这里使用旧版接口作为示例，生产环境需实现签名算法
-	// 或参考: https://github.com/SocialSisterYi/bilibili-API-collect
-	url := "https://api.bilibili.com/x/player/playurl"
-
-	req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	apiURL := "https://api.bilibili.com/x/player/playurl"
+	
+	req, err := http.NewRequestWithContext(context.Background(), "GET", apiURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
 
 	q := req.URL.Query()
 	q.Add("fnval", "4048")
 	q.Add("bvid", bvid)
 	q.Add("cid", cid)
-	q.Add("qn", "116")
+	q.Add("qn", "127")
 	req.URL.RawQuery = q.Encode()
 
 	for k, v := range c.headers {
@@ -154,26 +168,34 @@ func (c *BilibiliClient) GetStreamURLs(bvid, cid string) (*StreamURLs, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API返回错误状态码: %d, body: %s", resp.StatusCode, string(body))
+	}
 
 	var result struct {
 		Code int `json:"code"`
 		Data struct {
 			Dash struct {
 				Video []struct {
-					BaseURL string `json:"baseUrl"`
-					ID      int    `json:"id"`
-					Width   int    `json:"width"`
-					Height  int    `json:"height"` // 修复：小写
+					BaseURL   string `json:"baseUrl"`
+					ID        int    `json:"id"`
+					Codecs    string `json:"codecs"`
+					Width     int    `json:"width"`
+					Height    int    `json:"height"`
+					Bandwidth int    `json:"bandwidth"`
 				} `json:"video"`
 				Audio []struct {
-					BaseURL string `json:"baseUrl"`
-					ID      int    `json:"id"`
+					BaseURL   string `json:"baseUrl"`
+					Bandwidth int    `json:"bandwidth"`
+					Codecs    string `json:"codecs"`
 				} `json:"audio"`
-				Flac struct {
-					Audio struct {
+				Flac *struct {
+					Audio *struct {
 						BaseURL string `json:"baseUrl"`
 					} `json:"audio"`
 				} `json:"flac"`
@@ -182,34 +204,74 @@ func (c *BilibiliClient) GetStreamURLs(bvid, cid string) (*StreamURLs, error) {
 		Message string `json:"message"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("解析JSON失败: %w", err)
 	}
-
 	if result.Code != 0 {
 		return nil, fmt.Errorf("获取流地址失败: %s", result.Message)
 	}
 
-	if len(result.Data.Dash.Audio) == 0 {
-		return nil, fmt.Errorf("未找到音频流")
-	}
-	if len(result.Data.Dash.Video) == 0 {
-		return nil, fmt.Errorf("未找到视频流")
+	dash := result.Data.Dash
+	if len(dash.Video) == 0 || len(dash.Audio) == 0 {
+		return nil, fmt.Errorf("未找到视频或音频流")
 	}
 
-	urls := &StreamURLs{
-		AudioURL: result.Data.Dash.Audio[0].BaseURL,
-		VideoURL: result.Data.Dash.Video[0].BaseURL,
+	bestVideoIndex := 0
+	codecPriority := map[string]int{"avc": 3, "hev": 2, "av01": 1}
+	
+	for i, v := range dash.Video {
+		currentCodec := strings.ToLower(v.Codecs)
+		bestCodec := strings.ToLower(dash.Video[bestVideoIndex].Codecs)
+		
+		currentPriority := 0
+		bestPriority := 0
+		for codec, priority := range codecPriority {
+			if strings.Contains(currentCodec, codec) {
+				currentPriority = priority
+			}
+			if strings.Contains(bestCodec, codec) {
+				bestPriority = priority
+			}
+		}
+		
+		if currentPriority > bestPriority {
+			bestVideoIndex = i
+		} else if currentPriority == bestPriority && v.ID > dash.Video[bestVideoIndex].ID {
+			bestVideoIndex = i
+		}
 	}
 
-	// 优先使用Hi-Res音频
-	if result.Data.Dash.Flac.Audio.BaseURL != "" {
-		urls.AudioURL = result.Data.Dash.Flac.Audio.BaseURL
+	bestVideo := dash.Video[bestVideoIndex]
+
+	var bestAudioURL string
+	if dash.Flac != nil && dash.Flac.Audio != nil && dash.Flac.Audio.BaseURL != "" {
+		bestAudioURL = dash.Flac.Audio.BaseURL
+		fmt.Printf("  音频: FLAC无损\n")
+	} else {
+		bestAudioIndex := 0
+		for i, a := range dash.Audio {
+			if a.Bandwidth >= 180000 && a.Bandwidth <= 200000 {
+				bestAudioIndex = i
+				break
+			}
+			if a.Bandwidth > dash.Audio[bestAudioIndex].Bandwidth {
+				bestAudioIndex = i
+			}
+		}
+		bestAudioURL = dash.Audio[bestAudioIndex].BaseURL
+		fmt.Printf("  音频: %dkbps %s\n", dash.Audio[bestAudioIndex].Bandwidth/1000, dash.Audio[bestAudioIndex].Codecs)
 	}
 
-	return urls, nil
+	fmt.Printf("  视频: %s, %dx%d, %dkbps\n", 
+		bestVideo.Codecs, bestVideo.Width, bestVideo.Height, bestVideo.Bandwidth/1000)
+	
+	return &StreamURLs{
+		VideoURL: bestVideo.BaseURL,
+		AudioURL: bestAudioURL,
+		Codec:    bestVideo.Codecs,
+		Quality:  bestVideo.Height,
+	}, nil
 }
 
-// DownloadAndConvert 下载并转换单个视频
 func (c *BilibiliClient) DownloadAndConvert(ctx context.Context, info VideoInfo, bvid string, outputDir string) error {
 	maxRetries := 3
 	var lastErr error
@@ -221,51 +283,115 @@ func (c *BilibiliClient) DownloadAndConvert(ctx context.Context, info VideoInfo,
 		default:
 		}
 
-		fmt.Printf("[%d/%d] 正在处理: %s (第%d次尝试)\n", info.Index, info.PartName, attempt)
+		fmt.Printf("[%d/%s] 正在处理: %s (尝试 %d/%d)\n", 
+			info.Index, bvid, info.PartName, attempt, maxRetries)
 
-		// 1. 获取流地址
 		urls, err := c.GetStreamURLs(bvid, info.CID)
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Second * 2)
+			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
 
-		// 2. 下载音频
-		audioPath := filepath.Join(outputDir, fmt.Sprintf("%s_P%d_%s_audio.mp3", bvid, info.Index, info.PartName))
-		if err := c.downloadAudio(urls.AudioURL, audioPath); err != nil {
+		tempBase := filepath.Join(outputDir, fmt.Sprintf(".tmp_%d_%s", info.Index, 
+			strings.TrimPrefix(info.PartName, ".")))
+		
+		audioTempPath := tempBase + "_audio.m4a"
+		videoTempPath := tempBase + "_video.mp4"
+		
+		if err := c.downloadStreamWithRetry(urls.AudioURL, audioTempPath, "音频"); err != nil {
 			lastErr = err
+			cleanupFiles(audioTempPath, videoTempPath)
 			continue
 		}
 
-		// 3. 按需下载视频
 		if c.config.DownloadVideo {
-			videoPath := filepath.Join(outputDir, fmt.Sprintf("%s_P%d_%s_video.mp4", bvid, info.Index, info.PartName))
-			finalPath := filepath.Join(outputDir, fmt.Sprintf("%s_P%d_%s.mp4", bvid, info.Index, info.PartName))
-
-			if err := c.downloadAndMergeVideo(urls.VideoURL, audioPath, videoPath, finalPath); err != nil {
+			finalPath := filepath.Join(outputDir, fmt.Sprintf("%d.%s.mp4", info.Index, info.PartName))
+			
+			if err := c.downloadStreamWithRetry(urls.VideoURL, videoTempPath, "视频"); err != nil {
 				lastErr = err
-				os.Remove(audioPath) // 清理临时文件
+				cleanupFiles(audioTempPath, videoTempPath)
 				continue
 			}
 
-			// 清理临时文件
-			os.Remove(audioPath)
-			os.Remove(videoPath)
-			fmt.Printf("✓ 视频下载完成: %s\n", finalPath)
+			fmt.Printf("  正在合并音视频...\n")
+			if err := c.mergeVideoAudio(videoTempPath, audioTempPath, finalPath); err != nil {
+				lastErr = err
+				cleanupFiles(audioTempPath, videoTempPath)
+				continue
+			}
+
+			cleanupFiles(audioTempPath, videoTempPath)
+			fmt.Printf("✓ 视频完成: %s\n", filepath.Base(finalPath))
 		} else {
-			fmt.Printf("✓ 音频下载完成: %s\n", audioPath)
+			finalAudioPath := filepath.Join(outputDir, fmt.Sprintf("%d.%s.mp3", info.Index, info.PartName))
+			fmt.Printf("  正在转码为MP3...\n")
+			if err := c.convertToMP3(audioTempPath, finalAudioPath); err != nil {
+				lastErr = err
+				cleanupFiles(audioTempPath)
+				continue
+			}
+			cleanupFiles(audioTempPath)
+			fmt.Printf("✓ 音频完成: %s\n", filepath.Base(finalAudioPath))
 		}
 
-		return nil // 成功则直接返回
+		return nil
 	}
 
 	return fmt.Errorf("重试%d次后失败: %w", maxRetries, lastErr)
 }
 
-// downloadAudio 下载音频流并转码为MP3
-func (c *BilibiliClient) downloadAudio(audioURL, outputPath string) error {
-	req, err := http.NewRequestWithContext(context.Background(), "GET", audioURL, nil)
+func (c *BilibiliClient) mergeVideoAudio(videoPath, audioPath, finalPath string) error {
+	cmd := exec.Command("ffmpeg",
+		"-i", videoPath,
+		"-i", audioPath,
+		"-c:v", "copy",
+		"-c:a", "copy",
+		"-shortest",
+		"-movflags", "+faststart",
+		"-y",
+		finalPath,
+	)
+	cmd.Stderr = os.Stderr
+	
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg合并失败: %w", err)
+	}
+	return nil
+}
+
+func (c *BilibiliClient) convertToMP3(inputPath, outputPath string) error {
+	cmd := exec.Command("ffmpeg",
+		"-i", inputPath,
+		"-c:a", "libmp3lame",
+		"-q:a", "0",
+		"-y",
+		outputPath,
+	)
+	cmd.Stderr = os.Stderr
+	
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg转码失败: %w", err)
+	}
+	return nil
+}
+
+
+func (c *BilibiliClient) downloadStreamWithRetry(streamURL, outputPath, streamType string) error {
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		if err := c.downloadStream(streamURL, outputPath); err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(i+1) * time.Second)
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("%s下载失败: %w", streamType, lastErr)
+}
+
+func (c *BilibiliClient) downloadStream(streamURL, outputPath string) error {
+	req, err := http.NewRequestWithContext(context.Background(), "GET", streamURL, nil)
 	if err != nil {
 		return err
 	}
@@ -281,75 +407,133 @@ func (c *BilibiliClient) downloadAudio(audioURL, outputPath string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("音频流返回状态码: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("返回状态码: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	// 确保输出目录存在
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
 	}
 
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ==================== 独立辅助函数 ====================
+
+func parsePartSelection(input string, max int) ([]int, error) {
+	input = strings.TrimSpace(strings.ToLower(input))
+	
+	if input == "" || input == "all" {
+		parts := make([]int, max)
+		for i := 0; i < max; i++ {
+			parts[i] = i + 1
+		}
+		return parts, nil
+	}
+
+	selected := make(map[int]bool)
+	parts := strings.Split(input, ",")
+	
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) != 2 {
+				return nil, fmt.Errorf("无效的格式: %s", part)
+			}
+			
+			start, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+			if err != nil {
+				return nil, fmt.Errorf("无效的数字: %s", rangeParts[0])
+			}
+			
+			end, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+			if err != nil {
+				return nil, fmt.Errorf("无效的数字: %s", rangeParts[1])
+			}
+			
+			if start < 1 || end > max || start > end {
+				return nil, fmt.Errorf("无效的范围: %d-%d (有效范围: 1-%d)", start, end, max)
+			}
+			
+			for i := start; i <= end; i++ {
+				selected[i] = true
+			}
+		} else {
+			num, err := strconv.Atoi(part)
+			if err != nil {
+				return nil, fmt.Errorf("无效的数字: %s", part)
+			}
+			
+			if num < 1 || num > max {
+				return nil, fmt.Errorf("分P编号 %d 超出范围 (有效范围: 1-%d)", num, max)
+			}
+			
+			selected[num] = true
+		}
+	}
+
+	result := make([]int, 0, len(selected))
+	for num := range selected {
+		result = append(result, num)
+	}
+	
+	return result, nil
+}
+
+func mergeVideoAudio(videoPath, audioPath, finalPath string) error {
 	cmd := exec.Command("ffmpeg",
-		"-i", "pipe:0",
-		"-q:a", "0", // 最高质量MP3
-		"-f", "mp3",
-		"-y", // 覆盖已存在文件
+		"-i", videoPath,
+		"-i", audioPath,
+		"-c:v", "copy",
+		"-c:a", "copy",
+		"-shortest",
+		"-movflags", "+faststart",
+		"-y",
+		finalPath,
+	)
+	cmd.Stderr = os.Stderr
+	
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg合并失败: %w", err)
+	}
+	return nil
+}
+
+func convertToMP3(inputPath, outputPath string) error {
+	cmd := exec.Command("ffmpeg",
+		"-i", inputPath,
+		"-c:a", "libmp3lame",
+		"-q:a", "0",
+		"-y",
 		outputPath,
 	)
-	cmd.Stdin = resp.Body
-	cmd.Stderr = os.Stderr // 输出ffmpeg错误日志
-
+	cmd.Stderr = os.Stderr
+	
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ffmpeg转码失败: %w", err)
 	}
-
 	return nil
 }
 
-// downloadAndMergeVideo 下载视频流并与音频合并
-func (c *BilibiliClient) downloadAndMergeVideo(videoURL, audioPath, videoTempPath, finalPath string) error {
-	// 下载视频流
-	req, err := http.NewRequestWithContext(context.Background(), "GET", videoURL, nil)
-	if err != nil {
-		return err
+func cleanupFiles(paths ...string) {
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "清理临时文件失败 %s: %v\n", p, err)
+		}
 	}
-
-	for k, v := range c.headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("视频流返回状态码: %d", resp.StatusCode)
-	}
-
-	// 直接合并音视频到最终文件
-	cmd := exec.Command("ffmpeg",
-		"-i", "pipe:0",
-		"-i", audioPath,
-		"-c:v", c.config.VideoEncoder,
-		"-c:a", "copy", // 音频直接复制
-		"-shortest",
-		"-y",
-		"-f", "mp4",
-		finalPath,
-	)
-	cmd.Stdin = resp.Body
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("视频合并失败: %w", err)
-	}
-
-	return nil
 }
 
-// checkFFmpeg 检查ffmpeg是否可用
 func checkFFmpeg() error {
 	cmd := exec.Command("ffmpeg", "-version")
 	if err := cmd.Run(); err != nil {
@@ -358,10 +542,16 @@ func checkFFmpeg() error {
 	return nil
 }
 
-// loadConfig 加载配置文件
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{
+				Concurrency:  3,
+				Timeout:      300,
+				VideoEncoder: "libx264",
+			}, nil
+		}
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
@@ -370,12 +560,11 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
-	// 设置默认值
 	if config.Concurrency <= 0 {
-		config.Concurrency = 3 // 默认3个并发
+		config.Concurrency = 3
 	}
 	if config.Timeout <= 0 {
-		config.Timeout = 300 // 默认5分钟超时
+		config.Timeout = 300
 	}
 	if config.VideoEncoder == "" {
 		config.VideoEncoder = "libx264"
@@ -384,17 +573,92 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
+func GetBvidFromURL(videoURL string) (string, error) {
+	videoURL = strings.TrimSpace(videoURL)
+	
+	if strings.HasPrefix(videoURL, "BV") && len(videoURL) == 12 {
+		return videoURL, nil
+	}
+
+	if strings.Contains(videoURL, "b23.tv") || strings.Contains(videoURL, "bili2233.cn") {
+		realURL, err := followRedirect(videoURL)
+		if err != nil {
+			return "", fmt.Errorf("短链接解析失败: %v", err)
+		}
+		videoURL = realURL
+	}
+
+	re := regexp.MustCompile(`BV[0-9a-zA-Z]{10}`)
+	matches := re.FindStringSubmatch(videoURL)
+	if len(matches) == 0 {
+		return "", fmt.Errorf("未找到有效的BV号")
+	}
+	return matches[0], nil
+}
+
+func followRedirect(shortURL string) (string, error) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(shortURL)
+	if err != nil {
+		return "", fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if location := resp.Header.Get("Location"); location != "" {
+			return location, nil
+		}
+	}
+	return shortURL, nil
+}
+
+func loadCookie(config *Config, cookieFile string) error {
+	if cookieFile != "" {
+		data, err := os.ReadFile(cookieFile)
+		if err != nil {
+			return fmt.Errorf("读取Cookie文件失败: %w", err)
+		}
+		config.Cookie = strings.TrimSpace(string(data))
+		fmt.Printf("✓ 已从文件加载Cookie: %s\n", cookieFile)
+		return nil
+	}
+
+	if envCookie := os.Getenv("BILIBILI_COOKIE"); envCookie != "" {
+		config.Cookie = envCookie
+		fmt.Println("✓ 已从环境变量加载Cookie")
+		return nil
+	}
+
+	if config.Cookie != "" {
+		fmt.Println("✓ 已从配置文件加载Cookie")
+		return nil
+	}
+
+	fmt.Println("⚠ 警告：未配置Cookie，可能无法下载部分视频")
+	return nil
+}
+
+// ==================== main函数（最后） ====================
+
 func main() {
-	// 1. 检查依赖
+	cookieFile := flag.String("cookie-file", "", "指定Cookie文件路径")
+	downloadDir := flag.String("output", "./download", "指定输出目录")
+	flag.Parse()
+
 	if err := checkFFmpeg(); err != nil {
 		fmt.Fprintf(os.Stderr, "环境检查失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 2. 加载配置
 	configPath := "./miaoConfig.json"
-	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+	if flag.NArg() > 0 {
+		configPath = flag.Arg(0)
 	}
 
 	config, err := loadConfig(configPath)
@@ -403,20 +667,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 3. 创建客户端
-	client := NewBilibiliClient(config)
-
-	// 4. 输入BV号
-	var bvid string
-	fmt.Print("请输入B站视频BV号 (如: BV1xx411c7mD): ")
-	fmt.Scanln(&bvid)
-	bvid = strings.TrimSpace(bvid)
-	if bvid == "" {
-		fmt.Fprintln(os.Stderr, "BV号不能为空")
+	if err := loadCookie(config, *cookieFile); err != nil {
+		fmt.Fprintf(os.Stderr, "Cookie加载失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 5. 获取视频信息
+	client := NewBilibiliClient(config)
+
+	fmt.Print("请输入B站视频链接或BV号: ")
+	var input string
+	fmt.Scanln(&input)
+
+	bvid, err := GetBvidFromURL(input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "解析失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("解析成功，BV号: %s\n", bvid)
+
 	fmt.Println("正在获取视频信息...")
 	videoInfos, err := client.GetVideoInfo(bvid)
 	if err != nil {
@@ -425,40 +693,69 @@ func main() {
 	}
 
 	fmt.Printf("共找到 %d 个分P\n", len(videoInfos))
+	for i, info := range videoInfos {
+		fmt.Printf("  [%d] %s\n", i+1, info.PartName)
+	}
 	if config.DownloadVideo {
 		fmt.Printf("下载模式: 视频+音频 (编码器: %s)\n", config.VideoEncoder)
 	} else {
 		fmt.Println("下载模式: 仅音频")
 	}
 
-	// 6. 创建下载目录
-	outputDir := filepath.Join(".", "download", bvid)
+	var selectedIndices []int
+	if len(videoInfos) > 1 {
+		fmt.Print("\n请输入要下载的分P (all=全部, 1=第一集, 1-3=1到3集, 1,3,5=第1,3,5集): ")
+		var selection string
+		fmt.Scanln(&selection)
+		
+		selectedIndices, err = parsePartSelection(selection, len(videoInfos))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "输入无效: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		selectedIndices = []int{1}
+	}
+
+	selectedInfos := make([]VideoInfo, 0)
+	for _, info := range videoInfos {
+		for _, idx := range selectedIndices {
+			if info.Index == idx {
+				selectedInfos = append(selectedInfos, info)
+				break
+			}
+		}
+	}
+	fmt.Printf("已选择下载 %d 个分P\n\n", len(selectedInfos))
+
+	outputDir := filepath.Join(*downloadDir, bvid)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "创建目录失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 7. 并发下载（使用信号量控制）
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(videoInfos))
-	semaphore := make(chan struct{}, config.Concurrency)
-
-	// 处理中断信号
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		os.Stdin.Read(make([]byte, 1)) // 按回车取消
+		<-sigCh
+		fmt.Println("\n接收到中断信号，正在取消任务...")
 		cancel()
 	}()
 
-	for _, info := range videoInfos {
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(selectedInfos))
+	semaphore := make(chan struct{}, config.Concurrency)
+
+	for _, info := range selectedInfos {
 		wg.Add(1)
-		semaphore <- struct{}{} // 获取信号量
+		semaphore <- struct{}{}
 
 		go func(vi VideoInfo) {
 			defer wg.Done()
-			defer func() { <-semaphore }() // 释放信号量
+			defer func() { <-semaphore }()
 
 			if err := client.DownloadAndConvert(ctx, vi, bvid, outputDir); err != nil {
 				errCh <- fmt.Errorf("P%d %s: %w", vi.Index, vi.PartName, err)
@@ -466,7 +763,6 @@ func main() {
 		}(info)
 	}
 
-	// 8. 等待完成并处理错误
 	go func() {
 		wg.Wait()
 		close(errCh)
@@ -478,7 +774,6 @@ func main() {
 		errorCount++
 	}
 
-	// 9. 总结
-	fmt.Printf("\n下载完成! 成功: %d, 失败: %d\n", len(videoInfos)-errorCount, errorCount)
+	fmt.Printf("\n下载完成! 成功: %d, 失败: %d\n", len(selectedInfos)-errorCount, errorCount)
 	fmt.Printf("文件保存在: %s\n", outputDir)
 }
