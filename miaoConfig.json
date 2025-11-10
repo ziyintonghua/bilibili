@@ -1,5 +1,5 @@
 {
     "cookie": "",
-    "downloadVideo": false,
+    "downloadVideo": true,
     "videoEncoder": "copy"
 }
